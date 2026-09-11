@@ -407,41 +407,68 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
       !existingLog?.publicReplySentAt &&
       !existingLog?.publicReplyDeliveryUnconfirmed
     ) {
-      try {
-        const chosen = replyPool[Math.floor(Math.random() * replyPool.length)];
-        const publicReply = renderMessageWithTracking({
-          message: chosen,
-          commenterName,
-          trackedLinks: automation.trackedLinks,
-        });
-        await sendCommentReply({
-          context: accessToken,
-          commentId: commentId,
-          message: publicReply,
-          postId: mediaId,
-        });
-        await prisma.dmLog.update({
-          where: {
-            automationId_commentId: { automationId: automation.id, commentId },
-          },
-          data: { publicReplySentAt: new Date(), publicReplyError: null },
-        });
-      } catch (error) {
-        console.error(
-          "[DM Worker] Public comment reply failed:",
-          formatError(error)
-        );
-        await prisma.dmLog
-          .update({
+      // Claim the send atomically before making it. Two jobs can legitimately
+      // race on the same comment — the polling reconciler re-enqueues anything
+      // not yet fully handled, and a comment stuck retrying under a rate limit
+      // looks unhandled to every sweep in between — so the `existingLog` read
+      // above is stale by the time either job gets here. This UPDATE ... WHERE
+      // is a single atomic statement: only the job that flips
+      // `publicReplySentAt` from null to non-null wins the row, so only one of
+      // them can proceed to actually post.
+      const claim = await prisma.dmLog.updateMany({
+        where: {
+          automationId: automation.id,
+          commentId,
+          publicReplySentAt: null,
+          publicReplyDeliveryUnconfirmed: false,
+        },
+        data: { publicReplySentAt: new Date() },
+      });
+
+      if (claim.count > 0) {
+        try {
+          const chosen = replyPool[Math.floor(Math.random() * replyPool.length)];
+          const publicReply = renderMessageWithTracking({
+            message: chosen,
+            commenterName,
+            trackedLinks: automation.trackedLinks,
+          });
+          await sendCommentReply({
+            context: accessToken,
+            commentId: commentId,
+            message: publicReply,
+            postId: mediaId,
+          });
+          await prisma.dmLog.update({
             where: {
-              automationId_commentId: {
-                automationId: automation.id,
-                commentId,
-              },
+              automationId_commentId: { automationId: automation.id, commentId },
             },
-            data: { publicReplyError: formatError(error), publicReplyDeliveryUnconfirmed: error instanceof ZernioDeliveryUnconfirmedError },
-          })
-          .catch(() => {});
+            data: { publicReplyError: null },
+          });
+        } catch (error) {
+          console.error(
+            "[DM Worker] Public comment reply failed:",
+            formatError(error)
+          );
+          await prisma.dmLog
+            .update({
+              where: {
+                automationId_commentId: {
+                  automationId: automation.id,
+                  commentId,
+                },
+              },
+              data: {
+                publicReplyError: formatError(error),
+                publicReplyDeliveryUnconfirmed: error instanceof ZernioDeliveryUnconfirmedError,
+                // Release the claim on any non-"unconfirmed" failure so a
+                // later pass can retry it; an unconfirmed delivery is left
+                // alone (the flag above is enough to stop future retries).
+                publicReplySentAt: null,
+              },
+            })
+            .catch(() => {});
+        }
       }
     }
 
